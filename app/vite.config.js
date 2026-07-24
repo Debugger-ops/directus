@@ -28,7 +28,7 @@ const EXTENSIONS_PATH = process.env.EXTENSIONS_LOCATION
 const extensionsPathExists = fs.existsSync(EXTENSIONS_PATH);
 
 // https://vitejs.dev/config/
-export default defineConfig({
+export default defineConfig(({ command }) => ({
 	css: {
 		preprocessorOptions: {
 			scss: {
@@ -64,7 +64,9 @@ export default defineConfig({
 	resolve: {
 		alias: [{ find: '@', replacement: path.resolve(__dirname, 'src') }],
 	},
-	base: process.env.NODE_ENV === 'production' ? '' : '/admin',
+	// Derived from the actual Vite command rather than NODE_ENV, since NODE_ENV
+	// isn't guaranteed to be 'production' for every build invocation (e.g. CI).
+	base: command === 'build' ? '' : '/admin',
 	server: {
 		port: 8080,
 		proxy: {
@@ -97,25 +99,86 @@ export default defineConfig({
 			},
 		},
 	},
-});
+}));
 
+/**
+ * Resolve the real (symlink-following) paths of every installed extension
+ * folder, so the Vite dev server is allowed to serve files from them.
+ * Silently skips entries that can't be stat'd/resolved (e.g. broken
+ * symlinks, extensions removed mid-scan) instead of crashing config load.
+ */
 function getExtensionsRealPaths() {
-	return extensionsPathExists
-		? fs
-				.readdirSync(EXTENSIONS_PATH)
-				.flatMap((typeDir) => {
-					const extensionTypeDir = path.join(EXTENSIONS_PATH, typeDir);
-					if (!fs.statSync(extensionTypeDir).isDirectory()) return;
-					return fs.readdirSync(extensionTypeDir).map((dir) => fs.realpathSync(path.join(extensionTypeDir, dir)));
-				})
-				.filter((v) => v)
-		: [];
+	if (!extensionsPathExists) return [];
+
+	const realPaths: string[] = [];
+
+	for (const typeDir of fs.readdirSync(EXTENSIONS_PATH)) {
+		const extensionTypeDir = path.join(EXTENSIONS_PATH, typeDir);
+
+		let isDirectory: boolean;
+
+		try {
+			isDirectory = fs.statSync(extensionTypeDir).isDirectory();
+		} catch {
+			continue; // stale entry, ignore
+		}
+
+		if (!isDirectory) continue;
+
+		for (const dir of fs.readdirSync(extensionTypeDir)) {
+			try {
+				realPaths.push(fs.realpathSync(path.join(extensionTypeDir, dir)));
+			} catch {
+				// stale symlink or removed extension, ignore
+			}
+		}
+	}
+
+	return realPaths;
 }
 
 function directusExtensions() {
 	const virtualExtensionsId = '@directus-extensions';
+	let extensionsEntrypoint: string | null = null;
 
-	let extensionsEntrypoint = null;
+	async function loadExtensions() {
+		const localExtensions = extensionsPathExists ? await resolveFsExtensions(EXTENSIONS_PATH) : new Map();
+		const moduleExtensions = await resolveModuleExtensions(API_PATH);
+		const registryExtensions = extensionsPathExists
+			? await resolveFsExtensions(path.join(EXTENSIONS_PATH, '.registry'))
+			: new Map();
+
+		// Builds the settings entries for one extension: itself, plus one entry
+		// per sub-extension if it's a bundle.
+		const toSettings = (source: string) => ([folder, extension]: [string, any]) => {
+			const settings = [{ id: extension.name, enabled: true, folder, bundle: null, source }];
+
+			if (extension.type === 'bundle') {
+				settings.push(
+					...extension.entries.map((entry: { name: string }) => ({
+						enabled: true,
+						folder: entry.name,
+						bundle: extension.name,
+						source,
+					})),
+				);
+			}
+
+			return settings;
+		};
+
+		// default to enabled for app extension in developer mode
+		const extensionSettings = [
+			...Array.from(localExtensions.entries()).flatMap(toSettings('local')),
+			...Array.from(moduleExtensions.entries()).flatMap(toSettings('module')),
+			...Array.from(registryExtensions.entries()).flatMap(toSettings('registry')),
+		];
+
+		extensionsEntrypoint = generateExtensionsEntrypoint(
+			{ module: moduleExtensions, local: localExtensions, registry: registryExtensions },
+			extensionSettings,
+		);
+	}
 
 	return [
 		{
@@ -129,12 +192,12 @@ function directusExtensions() {
 			async buildStart() {
 				await loadExtensions();
 			},
-			resolveId(id) {
+			resolveId(id: string) {
 				if (id === virtualExtensionsId) {
 					return id;
 				}
 			},
-			load(id) {
+			load(id: string) {
 				if (id === virtualExtensionsId) {
 					return extensionsEntrypoint;
 				}
@@ -160,56 +223,4 @@ function directusExtensions() {
 			}),
 		},
 	];
-
-	async function loadExtensions() {
-		const localExtensions = extensionsPathExists ? await resolveFsExtensions(EXTENSIONS_PATH) : new Map();
-		const moduleExtensions = await resolveModuleExtensions(API_PATH);
-
-		const registryExtensions = extensionsPathExists
-			? await resolveFsExtensions(path.join(EXTENSIONS_PATH, '.registry'))
-			: new Map();
-
-		const mockSetting = (source, folder, extension) => {
-			const settings = [
-				{
-					id: extension.name,
-					enabled: true,
-					folder: folder,
-					bundle: null,
-					source: source,
-				},
-			];
-
-			if (extension.type === 'bundle') {
-				settings.push(
-					...extension.entries.map((entry) => ({
-						enabled: true,
-						folder: entry.name,
-						bundle: extension.name,
-						source: source,
-					})),
-				);
-			}
-
-			return settings;
-		};
-
-		// default to enabled for app extension in developer mode
-		const extensionSettings = [
-			...Array.from(localExtensions.entries()).flatMap(([folder, extension]) =>
-				mockSetting('local', folder, extension),
-			),
-			...Array.from(moduleExtensions.entries()).flatMap(([folder, extension]) =>
-				mockSetting('module', folder, extension),
-			),
-			...Array.from(registryExtensions.entries()).flatMap(([folder, extension]) =>
-				mockSetting('registry', folder, extension),
-			),
-		];
-
-		extensionsEntrypoint = generateExtensionsEntrypoint(
-			{ module: moduleExtensions, local: localExtensions, registry: registryExtensions },
-			extensionSettings,
-		);
-	}
 }
